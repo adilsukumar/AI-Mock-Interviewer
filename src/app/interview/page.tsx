@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, Suspense } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { CheckCircle, Info, Mic, Loader2, Volume2, Camera } from 'lucide-react';
 
@@ -20,7 +20,7 @@ const COMPANY_COLORS: Record<string, string> = {
   "Stripe": "radial-gradient(circle at 30% 30%, #635BFF, #00D4FF, #0A2540)"
 };
 
-export default function InterviewPage() {
+function InterviewContent() {
   const searchParams = useSearchParams();
   const router = useRouter();
   
@@ -486,5 +486,13 @@ export default function InterviewPage() {
         </div>
       )}
     </main>
+  );
+}
+
+export default function InterviewPage() {
+  return (
+    <Suspense fallback={<main style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center' }}><div className="title">Loading Interview...</div></main>}>
+      <InterviewContent />
+    </Suspense>
   );
 }

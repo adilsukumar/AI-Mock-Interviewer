@@ -34,13 +34,14 @@ function InterviewContent() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [isListening, setIsListening] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [isEvaluating, setIsEvaluating] = useState(false);
   
   // Audio state
   const [accumulatedTranscript, setAccumulatedTranscript] = useState('');
   const [interimTranscript, setInterimTranscript] = useState('');
   const [error, setError] = useState('');
   const [evaluation, setEvaluation] = useState<string | null>(null);
-  const [isEvaluating, setIsEvaluating] = useState(false);
 
   // Vision State
   const [visionAnalysis, setVisionAnalysis] = useState<string>('');
@@ -57,6 +58,25 @@ function InterviewContent() {
   // Voice Selection State
   const [availableVoices, setAvailableVoices] = useState<SpeechSynthesisVoice[]>([]);
   const [selectedVoiceURI, setSelectedVoiceURI] = useState<string>('');
+
+  // Refs for state
+  const isSpeakingRef = useRef(isSpeaking);
+  useEffect(() => { isSpeakingRef.current = isSpeaking; }, [isSpeaking]);
+  
+  const isProcessingRef = useRef(isProcessing);
+  useEffect(() => { isProcessingRef.current = isProcessing; }, [isProcessing]);
+  
+  const isEvaluatingRef = useRef(isEvaluating);
+  useEffect(() => { isEvaluatingRef.current = isEvaluating; }, [isEvaluating]);
+
+  const accumulatedTranscriptRef = useRef(accumulatedTranscript);
+  useEffect(() => { accumulatedTranscriptRef.current = accumulatedTranscript; }, [accumulatedTranscript]);
+  
+  const messagesRef = useRef(messages);
+  useEffect(() => { messagesRef.current = messages; }, [messages]);
+
+  const setupPhaseRef = useRef(setupPhase);
+  useEffect(() => { setupPhaseRef.current = setupPhase; }, [setupPhase]);
 
   // Auto-scroll
   const scrollToBottom = () => {
@@ -152,7 +172,10 @@ function InterviewContent() {
 
           clearTimeout(silenceTimerRef.current);
           silenceTimerRef.current = setTimeout(() => {
-            triggerSendFromSilence();
+            const fullText = (accumulatedTranscriptRef.current + ' ' + currentInterim).trim();
+            if (fullText.length > 5 && !isSpeakingRef.current && !isEvaluatingRef.current && !isProcessingRef.current) {
+              handleSendResponse(fullText);
+            }
           }, 2500);
         };
 
@@ -165,7 +188,7 @@ function InterviewContent() {
 
         recognition.onend = () => {
           setIsListening(false);
-          if (!isSpeakingRef.current && !isEvaluatingRef.current) {
+          if (!isSpeakingRef.current && !isEvaluatingRef.current && !isProcessingRef.current && setupPhaseRef.current === 'interview') {
             try { recognition.start(); } catch(e) {}
           }
         };
@@ -181,25 +204,6 @@ function InterviewContent() {
       if (recognitionRef.current) recognitionRef.current.stop();
     };
   }, []);
-
-  const isSpeakingRef = useRef(isSpeaking);
-  useEffect(() => { isSpeakingRef.current = isSpeaking; }, [isSpeaking]);
-  
-  const isEvaluatingRef = useRef(isEvaluating);
-  useEffect(() => { isEvaluatingRef.current = isEvaluating; }, [isEvaluating]);
-
-  const accumulatedTranscriptRef = useRef(accumulatedTranscript);
-  useEffect(() => { accumulatedTranscriptRef.current = accumulatedTranscript; }, [accumulatedTranscript]);
-  
-  const messagesRef = useRef(messages);
-  useEffect(() => { messagesRef.current = messages; }, [messages]);
-
-  const triggerSendFromSilence = () => {
-    const fullText = accumulatedTranscriptRef.current.trim();
-    if (fullText.length > 0 && !isSpeakingRef.current && !isEvaluatingRef.current) {
-      handleSendResponse(fullText);
-    }
-  };
 
   const startInterview = async () => {
     try { recognitionRef.current?.start(); } catch(e) {}
@@ -225,7 +229,6 @@ function InterviewContent() {
       const audioUrl = URL.createObjectURL(blob);
       const audio = new Audio(audioUrl);
       
-      // Speed up the AI voice slightly for a faster pace
       audio.playbackRate = 1.15;
       
       audio.onended = () => {
@@ -254,7 +257,7 @@ function InterviewContent() {
         if (voice) utterance.voice = voice;
       }
 
-      utterance.rate = 1.15; // Faster pace
+      utterance.rate = 1.15;
       utterance.pitch = 1.0;
 
       utterance.onstart = () => {
@@ -278,6 +281,7 @@ function InterviewContent() {
   };
 
   const fetchResponse = async (history: Message[], action?: 'evaluate') => {
+    setIsProcessing(true);
     try {
       const res = await fetch('/api/chat', {
         method: 'POST',
@@ -286,11 +290,10 @@ function InterviewContent() {
       });
 
       const data = await res.json();
-      if (data.error) { setError(data.error); return; }
+      if (data.error) { setError(data.error); setIsProcessing(false); return; }
 
       let aiReply = data.reply.trim();
       
-      // Handle Auto-End Logic smoothly
       let isComplete = false;
       if (aiReply.includes('[INTERVIEW_COMPLETE]')) {
         isComplete = true;
@@ -299,15 +302,18 @@ function InterviewContent() {
       
       if (action === 'evaluate') {
         setEvaluation(aiReply);
-        speak(aiReply);
-      } else {
-        if (!isEvaluatingRef.current) {
-          setMessages([...history, { role: 'assistant', content: aiReply }]);
-          speak(aiReply, isComplete);
-        }
+        setIsEvaluating(false);
+        setIsProcessing(false);
+        if (recognitionRef.current) recognitionRef.current.stop();
+        return;
       }
+      
+      setMessages(prev => [...prev, { role: 'assistant', content: aiReply }]);
+      setIsProcessing(false);
+      speak(aiReply, isComplete);
     } catch (err: any) {
       setError(err.message || 'Network error');
+      setIsProcessing(false);
     }
   };
 
@@ -437,10 +443,12 @@ function InterviewContent() {
             <div style={{ marginTop: '20px', fontSize: '1.1rem', color: isListening ? '#10b981' : 'var(--accent-secondary)', fontWeight: 600, letterSpacing: '1px', textTransform: 'uppercase', display: 'flex', alignItems: 'center', gap: '8px' }}>
               {isSpeaking ? (
                 <>AI is speaking...</>
+              ) : isProcessing ? (
+                <>Processing <Loader2 className="spinner" size={18} /></>
               ) : isListening ? (
                 <><span className="pulse-dot"></span> Listening...</>
               ) : (
-                <>Processing <Loader2 className="spinner" size={18} /></>
+                <>Waiting...</>
               )}
             </div>
 

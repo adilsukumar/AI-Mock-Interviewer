@@ -88,3 +88,15 @@ test('unexpected recognition abort offers recovery instead of silently remaining
   c.start();r.onstart();r.onerror({error:'aborted'});r.onend();
   assert.equal(r.starts,1);assert.equal(events.filter(e=>e[0]==='error').length,1);
 });
+
+test('network failure exposes its code for automatic server transcription fallback',()=>{
+  const recognition={start(){},stop(){},abort(){},onstart:null,onend:null,onerror:null};
+  let failure;
+  const controller=createRecognitionController(recognition,{
+    canListen:()=>true,onListeningChange(){},onRecovered(){},
+    onError:(message,code)=>failure={message,code}
+  });
+  controller.start();recognition.onstart();recognition.onerror({error:'network'});
+  assert.equal(failure.code,'network');
+  assert.match(failure.message,/service could not connect/);
+});

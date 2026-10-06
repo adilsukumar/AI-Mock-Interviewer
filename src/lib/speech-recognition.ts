@@ -55,7 +55,7 @@ export async function checkMicrophoneAccess(mediaDevices: Pick<MediaDevices, 'ge
 export function createRecognitionController(recognition: Recognition, callbacks: {
   canListen(): boolean;
   onListeningChange(listening: boolean): void;
-  onError(message: string): void;
+  onError(message: string, code?: string): void;
   onRecovered(): void;
 }) {
   let wanted = false;
@@ -75,7 +75,8 @@ export function createRecognitionController(recognition: Recognition, callbacks:
     } catch (error) {
       starting = false;
       wanted = false;
-      callbacks.onError(speechErrorMessage((error as { name?: string }).name || 'start-failed'));
+      const code = (error as { name?: string }).name || 'start-failed';
+      callbacks.onError(speechErrorMessage(code), code);
     }
   }
 
@@ -106,7 +107,7 @@ export function createRecognitionController(recognition: Recognition, callbacks:
       return;
     }
     wanted = false; // Fatal failures require an explicit retry, never a restart loop.
-    callbacks.onError(speechErrorMessage(event.error));
+    callbacks.onError(speechErrorMessage(event.error), event.error);
   };
   recognition.onend = () => {
     if (disposed) return;

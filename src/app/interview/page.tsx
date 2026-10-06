@@ -4,6 +4,7 @@ import { useState, useEffect, useRef, Suspense } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { CheckCircle, Info, Mic, Loader2, Volume2, Camera } from 'lucide-react';
 import { checkMicrophoneAccess, createRecognitionController, microphoneErrorMessage } from '@/lib/speech-recognition';
+import { createVoiceCapture } from '@/lib/audio-recording';
 
 type Message = {
   role: 'user' | 'assistant';
@@ -45,6 +46,8 @@ function InterviewContent() {
   const [microphoneError, setMicrophoneError] = useState('');
   const [microphoneAccess, setMicrophoneAccess] = useState<'unknown' | 'checking' | 'allowed' | 'blocked'>('unknown');
   const [isStarting, setIsStarting] = useState(false);
+  const [usesServerSpeech, setUsesServerSpeech] = useState(false);
+  const [isTranscribing, setIsTranscribing] = useState(false);
   const [evaluation, setEvaluation] = useState<string | null>(null);
 
   // Vision State
@@ -55,6 +58,12 @@ function InterviewContent() {
   const sessionEndedRef = useRef(false);
   const permissionCheckRef = useRef(false);
   const mountedRef = useRef(true);
+  const serverSpeechRef = useRef(false);
+  const captureRef = useRef<ReturnType<typeof createVoiceCapture> | null>(null);
+  const capturePendingRef = useRef(false);
+  const captureGenerationRef = useRef(0);
+  const transcriptionRef = useRef<AbortController | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
   const silenceTimerRef = useRef<any>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   
@@ -89,9 +98,132 @@ function InterviewContent() {
   const stopListening = () => {
     clearTimeout(silenceTimerRef.current);
     recognitionControllerRef.current?.stop();
+    captureGenerationRef.current++;
+    capturePendingRef.current = false;
+    captureRef.current?.cancel();
+    captureRef.current = null;
+    transcriptionRef.current?.abort();
+    transcriptionRef.current = null;
+    setIsTranscribing(false);
+    setIsListening(false);
   };
 
-  const startListening = () => recognitionControllerRef.current?.start();
+  const canCapture = () => mountedRef.current && setupPhaseRef.current === 'interview' && !sessionEndedRef.current &&
+    !isSpeakingRef.current && !isProcessingRef.current && !isEvaluatingRef.current;
+
+  const unlockAudio = () => {
+    const Context = window.AudioContext || (window as any).webkitAudioContext;
+    if (!Context) return;
+    try {
+      if (!audioContextRef.current || audioContextRef.current.state === 'closed') audioContextRef.current = new Context();
+      // Resume during a user gesture, including in browsers with strict autoplay rules.
+      void audioContextRef.current?.resume().catch(() => {});
+    } catch {}
+  };
+
+  const closeAudio = () => {
+    const context = audioContextRef.current;
+    audioContextRef.current = null;
+    if (context && context.state !== 'closed') void context.close().catch(() => {});
+  };
+
+  const submitAudio = async (blob: Blob, generation: number) => {
+    captureRef.current = null;
+    if (!canCapture() || generation !== captureGenerationRef.current) return;
+    setIsListening(false);
+    if (!blob.size) { setMicrophoneError('No audio was captured. Please retry the microphone.'); return; }
+    const controller = new AbortController();
+    transcriptionRef.current = controller;
+    setIsTranscribing(true);
+    const timer = setTimeout(() => controller.abort(), 55000);
+    try {
+      const form = new FormData();
+      const extension = blob.type.includes('mp4') ? 'mp4' : blob.type.includes('ogg') ? 'ogg' : 'webm';
+      form.append('audio', blob, `answer.${extension}`);
+      const response = await fetch('/api/transcribe', { method: 'POST', body: form, signal: controller.signal });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Transcription failed. Please retry the microphone.');
+      if (!canCapture() || generation !== captureGenerationRef.current || controller.signal.aborted) return;
+      if (typeof data.text !== 'string' || !data.text.trim()) throw new Error('No speech was detected. Please retry the microphone.');
+      // The upload has completed; sending the answer may now stop listening safely.
+      transcriptionRef.current = null;
+      setIsTranscribing(false);
+      setMicrophoneError('');
+      await handleSendResponse(data.text.trim());
+    } catch (err) {
+      if (canCapture() && generation === captureGenerationRef.current) {
+        setMicrophoneError(controller.signal.aborted ? 'Transcription timed out. Please retry the microphone.' : (err as Error).message);
+      }
+    } finally {
+      clearTimeout(timer);
+      if (transcriptionRef.current === controller) {
+        transcriptionRef.current = null;
+        if (mountedRef.current) setIsTranscribing(false);
+      }
+    }
+  };
+
+  const startAudioCapture = async () => {
+    if (!canCapture() || capturePendingRef.current || captureRef.current || transcriptionRef.current) return;
+    const Context = window.AudioContext || (window as any).webkitAudioContext;
+    if (typeof MediaRecorder === 'undefined' || !Context || !navigator.mediaDevices?.getUserMedia) {
+      setMicrophoneError('This browser cannot capture interview audio. Please use a current Chrome, Edge, Brave, Firefox, or Safari browser.');
+      return;
+    }
+    const generation = ++captureGenerationRef.current;
+    capturePendingRef.current = true;
+    const timer = setTimeout(() => {
+      if (generation !== captureGenerationRef.current) return;
+      captureGenerationRef.current++;
+      capturePendingRef.current = false;
+      if (mountedRef.current) setMicrophoneError(microphoneErrorMessage({ name: 'TimeoutError' }));
+    }, 15000);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+      if (!canCapture() || generation !== captureGenerationRef.current) {
+        stream.getTracks().forEach(track => track.stop());
+        return;
+      }
+      clearTimeout(timer);
+      capturePendingRef.current = false;
+      captureRef.current = createVoiceCapture(stream, MediaRecorder, Context, {
+        onComplete: blob => { void submitAudio(blob, generation); },
+        onError: message => {
+          if (generation !== captureGenerationRef.current || !mountedRef.current) return;
+          captureRef.current = null;
+          setIsListening(false);
+          setMicrophoneError(message);
+        }
+      }, audioContextRef.current || undefined);
+      setMicrophoneAccess('allowed');
+      setMicrophoneError('');
+      setIsListening(true);
+    } catch (err) {
+      if (mountedRef.current && generation === captureGenerationRef.current) {
+        setIsListening(false);
+        setMicrophoneError(microphoneErrorMessage(err as { name?: string }));
+      }
+    } finally {
+      clearTimeout(timer);
+      if (generation === captureGenerationRef.current) capturePendingRef.current = false;
+    }
+  };
+
+  const startListening = () => {
+    if (serverSpeechRef.current) void startAudioCapture();
+    else recognitionControllerRef.current?.start();
+  };
+
+  const enableServerSpeech = () => {
+    stopListening();
+    serverSpeechRef.current = true;
+    setUsesServerSpeech(true);
+    setMicrophoneError('');
+    accumulatedTranscriptRef.current = '';
+    setAccumulatedTranscript('');
+    setInterimTranscript('');
+    startListening();
+  };
 
   const verifyMicrophone = async () => {
     if (permissionCheckRef.current) return false;
@@ -99,7 +231,7 @@ function InterviewContent() {
     setMicrophoneError('');
     setMicrophoneAccess('checking');
     try {
-      if (!recognitionRef.current) {
+      if (!recognitionRef.current && typeof MediaRecorder === 'undefined') {
         throw new Error('speech-unsupported');
       }
       if (!navigator.mediaDevices?.getUserMedia) {
@@ -122,6 +254,7 @@ function InterviewContent() {
   };
 
   const retryMicrophone = async () => {
+    unlockAudio();
     if (await verifyMicrophone()) startListening();
   };
 
@@ -164,6 +297,7 @@ function InterviewContent() {
         setIsEvaluating(true);
         clearTimeout(silenceTimerRef.current);
         stopListening();
+        closeAudio();
         window.speechSynthesis.cancel();
         setIsSpeaking(false);
         setIsListening(false);
@@ -202,15 +336,18 @@ function InterviewContent() {
         recognition.lang = 'en-US';
 
         recognitionControllerRef.current = createRecognitionController(recognition, {
-          canListen: () => setupPhaseRef.current === 'interview' && !sessionEndedRef.current &&
+          canListen: () => !serverSpeechRef.current && setupPhaseRef.current === 'interview' && !sessionEndedRef.current &&
             !isSpeakingRef.current && !isProcessingRef.current && !isEvaluatingRef.current,
-          onListeningChange: setIsListening,
-          onError: setMicrophoneError,
-          onRecovered: () => setMicrophoneError('')
+          onListeningChange: listening => { if (!serverSpeechRef.current) setIsListening(listening); },
+          onError: (message, code) => {
+            if (code !== 'audio-capture' && typeof MediaRecorder !== 'undefined') enableServerSpeech();
+            else setMicrophoneError(message);
+          },
+          onRecovered: () => { if (!serverSpeechRef.current) setMicrophoneError(''); }
         });
 
         recognition.onresult = (event: any) => {
-          if (sessionEndedRef.current || isSpeakingRef.current || isProcessingRef.current || isEvaluatingRef.current) return;
+          if (serverSpeechRef.current || sessionEndedRef.current || isSpeakingRef.current || isProcessingRef.current || isEvaluatingRef.current) return;
           let currentInterim = '';
           let newFinalChunks = '';
 
@@ -239,12 +376,22 @@ function InterviewContent() {
 
         recognitionRef.current = recognition;
       } else {
-        setMicrophoneError("This browser does not support speech recognition. Open this page in Chrome or Edge.");
+        if (typeof MediaRecorder !== 'undefined') {
+          serverSpeechRef.current = true;
+          setUsesServerSpeech(true);
+        } else setMicrophoneError("This browser cannot record audio. Open this page in a current browser.");
       }
     }
     
     return () => {
       mountedRef.current = false;
+      captureGenerationRef.current++;
+      capturePendingRef.current = false;
+      captureRef.current?.cancel();
+      captureRef.current = null;
+      transcriptionRef.current?.abort();
+      transcriptionRef.current = null;
+      closeAudio();
       clearTimeout(silenceTimerRef.current);
       recognitionControllerRef.current?.dispose();
       recognitionControllerRef.current = null;
@@ -254,6 +401,7 @@ function InterviewContent() {
 
   const startInterview = async () => {
     if (permissionCheckRef.current) return;
+    unlockAudio();
     setIsStarting(true);
     if (!await verifyMicrophone()) { setIsStarting(false); return; }
     sessionEndedRef.current = false;
@@ -399,6 +547,7 @@ function InterviewContent() {
 
   const endAndEvaluate = async () => {
     sessionEndedRef.current = true;
+    closeAudio();
     isEvaluatingRef.current = true;
     setIsEvaluating(true);
     clearTimeout(silenceTimerRef.current);
@@ -427,6 +576,7 @@ function InterviewContent() {
               <li><strong>Camera Preview:</strong> Your webcam preview is shown during the interview. Automated vision monitoring is not enabled.</li>
               <li><strong>Do Not Switch Tabs:</strong> If you switch tabs, minimize the window, or leave this page, the interview will immediately terminate and you will fail.</li>
               <li><strong>Speak naturally:</strong> The AI will listen and automatically reply when you pause.</li>
+              <li><strong>Audio transcription:</strong> If your browser speech service is unavailable, your spoken answers are automatically sent to Groq for transcription after you pause. Keep each answer under two minutes.</li>
               <li><strong>Permissions:</strong> We will request microphone and camera access on the next step.</li>
             </ul>
           </div>
@@ -465,7 +615,7 @@ function InterviewContent() {
               <option key={v.voiceURI} value={v.voiceURI}>{v.name}</option>
             ))}
           </select>
-          <button onClick={() => { window.speechSynthesis.cancel(); router.push('/'); }} className="btn-danger" style={{ padding: '8px 16px', fontSize: '0.9rem', marginLeft: '12px' }}>
+          <button onClick={() => { sessionEndedRef.current = true; stopListening(); window.speechSynthesis.cancel(); router.push('/'); }} className="btn-danger" style={{ padding: '8px 16px', fontSize: '0.9rem', marginLeft: '12px' }}>
             Quit
           </button>
         </div>
@@ -475,12 +625,13 @@ function InterviewContent() {
         <p role="status">
           {microphoneAccess === 'allowed' ? 'Microphone access allowed' : microphoneAccess === 'checking' ? 'Checking microphone access...' : 'Microphone access needs checking'}
           {microphoneAccess === 'allowed' && (microphoneError ? ' — Speech recognition needs attention' :
-            isListening ? ' — Listening' : evaluation ? ' — Interview ended' :
+            isTranscribing ? ' — Transcribing your answer' : isListening ? ' — Listening' : evaluation ? ' — Interview ended' :
             error ? ' — Interview paused' : ' — Listening paused while the interviewer speaks or processes')}
         </p>
+        {usesServerSpeech && !evaluation && <p style={{ marginTop: '8px', fontSize: '0.85rem' }}>Automatic audio transcription is active. Speak normally and pause to send your answer.</p>}
         {microphoneError && <div role="alert" style={{ marginTop: '12px', color: '#fbbf24' }}>
           <p>{microphoneError}</p>
-          <button onClick={retryMicrophone} disabled={microphoneAccess === 'checking' || isSpeaking || isProcessing || isEvaluating || !!evaluation || !!error} className="btn-primary" style={{ marginTop: '12px' }}>
+          <button onClick={retryMicrophone} disabled={microphoneAccess === 'checking' || isSpeaking || isProcessing || isTranscribing || isEvaluating || !!evaluation || !!error} className="btn-primary" style={{ marginTop: '12px' }}>
             Retry microphone
           </button>
         </div>}
@@ -528,6 +679,8 @@ function InterviewContent() {
                 <>AI is speaking...</>
               ) : isProcessing ? (
                 <>Processing <Loader2 className="spinner" size={18} /></>
+              ) : isTranscribing ? (
+                <>Transcribing <Loader2 className="spinner" size={18} /></>
               ) : isListening ? (
                 <><span className="pulse-dot"></span> Listening...</>
               ) : (

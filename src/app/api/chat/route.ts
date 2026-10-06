@@ -46,11 +46,16 @@ Provide a brief, highly constructive summary of their strengths and areas for im
       }))
     ];
 
+    const model = process.env.GROQ_MODEL || 'openai/gpt-oss-20b';
     const chatCompletion = await groq.chat.completions.create({
       messages: apiMessages,
-      model: 'llama-3.3-70b-versatile',
+      model,
       temperature: 0.6,
-      max_tokens: 400,
+      max_completion_tokens: 1024,
+      ...(model.startsWith('openai/gpt-oss-') ? {
+        reasoning_effort: 'low' as const,
+        include_reasoning: false,
+      } : {}),
     });
 
     const reply = chatCompletion.choices[0]?.message?.content || 'Sorry, I missed that. Could you repeat?';

@@ -80,7 +80,7 @@ export default function Home() {
                <div className="orb-ring-1" style={{ width: '100px', height: '100px', animation: 'ripple 3s infinite linear' }}></div>
              </div>
              <div style={{ padding: '8px 16px', background: 'rgba(139, 92, 246, 0.15)', borderRadius: '20px', border: '1px solid rgba(139, 92, 246, 0.3)', color: 'var(--accent-primary)', fontWeight: 600, fontSize: '0.85rem', textTransform: 'uppercase', letterSpacing: '1px' }}>
-               Powered by Llama 3.3
+               Powered by Groq AI
              </div>
           </div>
           

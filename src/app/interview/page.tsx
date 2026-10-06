@@ -3,6 +3,7 @@
 import { useState, useEffect, useRef, Suspense } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { CheckCircle, Info, Mic, Loader2, Volume2, Camera } from 'lucide-react';
+import { checkMicrophoneAccess, createRecognitionController, microphoneErrorMessage } from '@/lib/speech-recognition';
 
 type Message = {
   role: 'user' | 'assistant';
@@ -41,12 +42,19 @@ function InterviewContent() {
   const [accumulatedTranscript, setAccumulatedTranscript] = useState('');
   const [interimTranscript, setInterimTranscript] = useState('');
   const [error, setError] = useState('');
+  const [microphoneError, setMicrophoneError] = useState('');
+  const [microphoneAccess, setMicrophoneAccess] = useState<'unknown' | 'checking' | 'allowed' | 'blocked'>('unknown');
+  const [isStarting, setIsStarting] = useState(false);
   const [evaluation, setEvaluation] = useState<string | null>(null);
 
   // Vision State
   const [visionAnalysis, setVisionAnalysis] = useState<string>('');
 
   const recognitionRef = useRef<any>(null);
+  const recognitionControllerRef = useRef<ReturnType<typeof createRecognitionController> | null>(null);
+  const sessionEndedRef = useRef(false);
+  const permissionCheckRef = useRef(false);
+  const mountedRef = useRef(true);
   const silenceTimerRef = useRef<any>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   
@@ -77,6 +85,45 @@ function InterviewContent() {
 
   const setupPhaseRef = useRef(setupPhase);
   useEffect(() => { setupPhaseRef.current = setupPhase; }, [setupPhase]);
+
+  const stopListening = () => {
+    clearTimeout(silenceTimerRef.current);
+    recognitionControllerRef.current?.stop();
+  };
+
+  const startListening = () => recognitionControllerRef.current?.start();
+
+  const verifyMicrophone = async () => {
+    if (permissionCheckRef.current) return false;
+    permissionCheckRef.current = true;
+    setMicrophoneError('');
+    setMicrophoneAccess('checking');
+    try {
+      if (!recognitionRef.current) {
+        throw new Error('speech-unsupported');
+      }
+      if (!navigator.mediaDevices?.getUserMedia) {
+        throw new Error('capture-unsupported');
+      }
+      await checkMicrophoneAccess(navigator.mediaDevices);
+      if (!mountedRef.current) return false;
+      setMicrophoneAccess('allowed');
+      return true;
+    } catch (err) {
+      if (!mountedRef.current) return false;
+      setMicrophoneAccess('blocked');
+      setMicrophoneError((err as Error).message === 'speech-unsupported'
+        ? 'This browser does not support speech recognition. Open this page in Chrome or Edge.'
+        : microphoneErrorMessage(err as { name?: string }));
+      return false;
+    } finally {
+      permissionCheckRef.current = false;
+    }
+  };
+
+  const retryMicrophone = async () => {
+    if (await verifyMicrophone()) startListening();
+  };
 
   // Auto-scroll
   const scrollToBottom = () => {
@@ -111,10 +158,12 @@ function InterviewContent() {
   useEffect(() => {
     const handleVisibilityChange = () => {
       if (document.hidden && setupPhase === 'interview' && !isEvaluatingRef.current) {
+        sessionEndedRef.current = true;
+        isEvaluatingRef.current = true;
         setEvaluation("CHEATING DETECTED: You switched tabs or minimized the window. The interview has been terminated.\n\nVerdict: Not Hired.");
         setIsEvaluating(true);
         clearTimeout(silenceTimerRef.current);
-        if (recognitionRef.current) recognitionRef.current.stop();
+        stopListening();
         window.speechSynthesis.cancel();
         setIsSpeaking(false);
         setIsListening(false);
@@ -143,6 +192,7 @@ function InterviewContent() {
 
   // Initialize Speech Recognition
   useEffect(() => {
+    mountedRef.current = true;
     if (typeof window !== 'undefined') {
       const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
       if (SpeechRecognition) {
@@ -151,9 +201,16 @@ function InterviewContent() {
         recognition.interimResults = true;
         recognition.lang = 'en-US';
 
-        recognition.onstart = () => setIsListening(true);
+        recognitionControllerRef.current = createRecognitionController(recognition, {
+          canListen: () => setupPhaseRef.current === 'interview' && !sessionEndedRef.current &&
+            !isSpeakingRef.current && !isProcessingRef.current && !isEvaluatingRef.current,
+          onListeningChange: setIsListening,
+          onError: setMicrophoneError,
+          onRecovered: () => setMicrophoneError('')
+        });
 
         recognition.onresult = (event: any) => {
+          if (sessionEndedRef.current || isSpeakingRef.current || isProcessingRef.current || isEvaluatingRef.current) return;
           let currentInterim = '';
           let newFinalChunks = '';
 
@@ -166,7 +223,8 @@ function InterviewContent() {
           }
 
           if (newFinalChunks) {
-            setAccumulatedTranscript(prev => prev + newFinalChunks);
+            accumulatedTranscriptRef.current += newFinalChunks;
+            setAccumulatedTranscript(accumulatedTranscriptRef.current);
           }
           setInterimTranscript(currentInterim);
 
@@ -179,41 +237,37 @@ function InterviewContent() {
           }, 2500);
         };
 
-        recognition.onerror = (event: any) => {
-          setIsListening(false);
-          if (event.error !== 'no-speech') {
-            setError(`Microphone error: ${event.error}`);
-          }
-        };
-
-        recognition.onend = () => {
-          setIsListening(false);
-          if (!isSpeakingRef.current && !isEvaluatingRef.current && !isProcessingRef.current && setupPhaseRef.current === 'interview') {
-            try { recognition.start(); } catch(e) {}
-          }
-        };
-
         recognitionRef.current = recognition;
       } else {
-        setError("Your browser doesn't support speech recognition. Please use Chrome or Edge.");
+        setMicrophoneError("This browser does not support speech recognition. Open this page in Chrome or Edge.");
       }
     }
     
     return () => {
+      mountedRef.current = false;
       clearTimeout(silenceTimerRef.current);
-      if (recognitionRef.current) recognitionRef.current.stop();
+      recognitionControllerRef.current?.dispose();
+      recognitionControllerRef.current = null;
+      recognitionRef.current = null;
     };
   }, []);
 
   const startInterview = async () => {
-    try { recognitionRef.current?.start(); } catch(e) {}
+    if (permissionCheckRef.current) return;
+    setIsStarting(true);
+    if (!await verifyMicrophone()) { setIsStarting(false); return; }
+    sessionEndedRef.current = false;
+    setupPhaseRef.current = 'interview';
     setSetupPhase('interview');
+    setIsStarting(false);
+    // Listen only after the AI introduction finishes playing.
     await fetchResponse([]);
   };
 
   const speak = async (text: string, isComplete?: boolean) => {
     if (typeof window !== 'undefined') window.speechSynthesis.cancel();
-    if (recognitionRef.current) recognitionRef.current.stop();
+    isSpeakingRef.current = true;
+    stopListening();
     setIsSpeaking(true);
 
     try {
@@ -232,12 +286,12 @@ function InterviewContent() {
       audio.playbackRate = 1.15;
       
       audio.onended = () => {
+        URL.revokeObjectURL(audioUrl);
+        isSpeakingRef.current = false;
         setIsSpeaking(false);
         if (isComplete) {
           endAndEvaluate();
-        } else if (recognitionRef.current && !isEvaluatingRef.current) {
-          try { recognitionRef.current.start(); } catch(e) {}
-        }
+        } else startListening();
       };
       
       await audio.play();
@@ -261,19 +315,24 @@ function InterviewContent() {
       utterance.pitch = 1.0;
 
       utterance.onstart = () => {
+        isSpeakingRef.current = true;
         setIsSpeaking(true);
-        if (recognitionRef.current) {
-          recognitionRef.current.stop();
-        }
+        stopListening();
       };
       
       utterance.onend = () => {
+        isSpeakingRef.current = false;
         setIsSpeaking(false);
         if (isComplete) {
           endAndEvaluate();
-        } else if (recognitionRef.current && !isEvaluatingRef.current) {
-          try { recognitionRef.current.start(); } catch(e) {}
-        }
+        } else startListening();
+      };
+
+      utterance.onerror = () => {
+        isSpeakingRef.current = false;
+        setIsSpeaking(false);
+        if (isComplete) endAndEvaluate();
+        else startListening();
       };
       
       window.speechSynthesis.speak(utterance);
@@ -281,6 +340,8 @@ function InterviewContent() {
   };
 
   const fetchResponse = async (history: Message[], action?: 'evaluate') => {
+    isProcessingRef.current = true;
+    stopListening();
     setIsProcessing(true);
     try {
       const res = await fetch('/api/chat', {
@@ -290,7 +351,8 @@ function InterviewContent() {
       });
 
       const data = await res.json();
-      if (data.error) { setError(data.error); setIsProcessing(false); return; }
+      if (data.error) { setError(data.error); return; }
+      if (sessionEndedRef.current && action !== 'evaluate') return;
 
       let aiReply = data.reply.trim();
       
@@ -304,15 +366,18 @@ function InterviewContent() {
         setEvaluation(aiReply);
         setIsEvaluating(false);
         setIsProcessing(false);
-        if (recognitionRef.current) recognitionRef.current.stop();
+        stopListening();
         return;
       }
       
       setMessages(prev => [...prev, { role: 'assistant', content: aiReply }]);
+      isProcessingRef.current = false;
       setIsProcessing(false);
       speak(aiReply, isComplete);
     } catch (err: any) {
       setError(err.message || 'Network error');
+    } finally {
+      isProcessingRef.current = false;
       setIsProcessing(false);
     }
   };
@@ -324,21 +389,22 @@ function InterviewContent() {
     setMessages(newMessages); // Show clean text in UI
     
     setAccumulatedTranscript('');
+    accumulatedTranscriptRef.current = '';
     setInterimTranscript('');
     
-    if (recognitionRef.current) {
-      recognitionRef.current.stop();
-    }
+    stopListening();
 
     await fetchResponse(newMessages);
   };
 
   const endAndEvaluate = async () => {
+    sessionEndedRef.current = true;
+    isEvaluatingRef.current = true;
     setIsEvaluating(true);
     clearTimeout(silenceTimerRef.current);
     clearInterval(visionTimerRef.current);
     
-    if (recognitionRef.current) recognitionRef.current.stop();
+    stopListening();
     window.speechSynthesis.cancel();
     
     setIsSpeaking(false);
@@ -358,14 +424,16 @@ function InterviewContent() {
           <h2 className="title" style={{ fontSize: '2.2rem', marginBottom: '16px' }}>Anti-Cheat Active</h2>
           <div style={{ color: 'var(--text-secondary)', lineHeight: '1.7', fontSize: '1.1rem', marginBottom: '40px', textAlign: 'left' }}>
             <ul style={{ paddingLeft: '20px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
-              <li><strong>Proctored Environment:</strong> The AI Vision model will actively scan your webcam to ensure you are not using phones, gadgets, or looking at other screens.</li>
+              <li><strong>Camera Preview:</strong> Your webcam preview is shown during the interview. Automated vision monitoring is not enabled.</li>
               <li><strong>Do Not Switch Tabs:</strong> If you switch tabs, minimize the window, or leave this page, the interview will immediately terminate and you will fail.</li>
               <li><strong>Speak naturally:</strong> The AI will listen and automatically reply when you pause.</li>
               <li><strong>Permissions:</strong> We will request microphone and camera access on the next step.</li>
             </ul>
           </div>
-          <button onClick={startInterview} className="btn-primary" style={{ width: '100%', padding: '16px', fontSize: '1.1rem' }}>
-            <Mic size={20} /> I Understand, Start Interview
+          {microphoneError && <p role="alert" style={{ color: '#fbbf24', marginBottom: '20px' }}>{microphoneError}</p>}
+          {isStarting && <p role="status" style={{ color: 'var(--text-secondary)', marginBottom: '16px' }}>Allow microphone access in the browser permission prompt.</p>}
+          <button onClick={startInterview} disabled={isStarting} className="btn-primary" style={{ width: '100%', padding: '16px', fontSize: '1.1rem' }}>
+            <Mic size={20} /> {isStarting ? 'Checking microphone...' : 'I Understand, Start Interview'}
           </button>
         </div>
       </main>
@@ -403,6 +471,21 @@ function InterviewContent() {
         </div>
       </div>
 
+      <div style={{ width: '100%', maxWidth: '1000px', marginBottom: '20px', color: 'var(--text-secondary)' }}>
+        <p role="status">
+          {microphoneAccess === 'allowed' ? 'Microphone access allowed' : microphoneAccess === 'checking' ? 'Checking microphone access...' : 'Microphone access needs checking'}
+          {microphoneAccess === 'allowed' && (microphoneError ? ' — Speech recognition needs attention' :
+            isListening ? ' — Listening' : evaluation ? ' — Interview ended' :
+            error ? ' — Interview paused' : ' — Listening paused while the interviewer speaks or processes')}
+        </p>
+        {microphoneError && <div role="alert" style={{ marginTop: '12px', color: '#fbbf24' }}>
+          <p>{microphoneError}</p>
+          <button onClick={retryMicrophone} disabled={microphoneAccess === 'checking' || isSpeaking || isProcessing || isEvaluating || !!evaluation || !!error} className="btn-primary" style={{ marginTop: '12px' }}>
+            Retry microphone
+          </button>
+        </div>}
+      </div>
+
       {error ? (
         <div className="glass-panel" style={{ borderColor: '#ef4444', textAlign: 'center', maxWidth: '500px' }}>
           <p style={{ color: '#ef4444', marginBottom: '24px', fontSize: '1.1rem' }}>{error}</p>
@@ -429,7 +512,7 @@ function InterviewContent() {
               <video ref={videoRef} autoPlay playsInline muted style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
               <canvas ref={canvasRef} width="320" height="240" style={{ display: 'none' }} />
               <div style={{ position: 'absolute', bottom: '5px', left: '5px', background: 'rgba(0,0,0,0.6)', padding: '2px 6px', borderRadius: '4px', fontSize: '0.6rem', color: '#10b981', display: 'flex', alignItems: 'center', gap: '4px' }}>
-                <span className="pulse-dot" style={{ width: '6px', height: '6px' }}></span> Vision Active
+                <span className="pulse-dot" style={{ width: '6px', height: '6px' }}></span> Camera Preview
               </div>
             </div>
 

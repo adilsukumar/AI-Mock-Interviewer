@@ -6,11 +6,15 @@ A voice-first mock interview project for rehearsing spoken answers, receiving fo
 
 **This is a practice simulation. Its “Hired” / “Not Hired” output is model-generated feedback, not an employment decision or a validated assessment of interview readiness.**
 
+<a id="the-practice-session"></a>
+
 ## <img src="assets/readme/icon-chat.svg" width="30" height="30" alt=""/> The practice session
 
 <p><picture><source media="(max-width: 600px)" srcset="assets/readme/features-mobile.svg"/><img src="assets/readme/features.svg" width="100%" alt="Spoken answers, configurable practice context, conversational follow-ups and generated feedback."/></picture></p>
 
 The prompt asks the interviewer to keep replies concise and aim for roughly four to five questions before returning an interview-complete marker. Completion is prompt-guided; it is not a guaranteed five-question counter. Company personas are generated prompt contexts, not official company interview materials.
+
+<a id="how-the-conversation-flows"></a>
 
 ## <img src="assets/readme/icon-voice.svg" width="30" height="30" alt=""/> How the conversation flows
 
@@ -26,6 +30,8 @@ The prompt asks the interviewer to keep replies concise and aim for roughly four
 | Session restriction | A visibility change can end the mock session. This does not establish that cheating occurred. |
 
 A working Groq API key and network access are required. Availability and quotas depend on the configured providers.
+
+<a id="run-locally"></a>
 
 ## <img src="assets/readme/icon-terminal.svg" width="30" height="30" alt=""/> Run locally
 
@@ -61,6 +67,8 @@ Run the existing microphone lifecycle regression checks:
 npm test
 ```
 
+<a id="permissions-and-data-flow"></a>
+
 ## <img src="assets/readme/icon-cloud.svg" width="30" height="30" alt=""/> Permissions and data flow
 
 <p><picture><source media="(max-width: 600px)" srcset="assets/readme/privacy-mobile.svg"/><img src="assets/readme/privacy.svg" width="100%" alt="Online processing: fallback speech goes to Groq, interview messages go to Groq and generated speech is requested from StreamElements. Webcam preview is not automated monitoring."/></picture></p>
@@ -72,6 +80,8 @@ Use a current browser on HTTPS (or localhost). Microphone permission and speech 
 Run microphone lifecycle regression checks with `npm test`.
 
 The interview screen shows a webcam preview. Its separate experimental vision endpoint is currently inactive in that session flow.
+
+<a id="explore-the-code"></a>
 
 ## <img src="assets/readme/icon-docs.svg" width="30" height="30" alt=""/> Explore the code
 
